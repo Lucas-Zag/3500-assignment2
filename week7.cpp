@@ -45,6 +45,20 @@ using namespace System::Net::Sockets;
 using namespace System::Text;
 using namespace System::Threading;
 
+
+void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^ y)
+{
+    if (!SM_L_) return;
+    Monitor::Enter(SM_L_->lockObject);
+    try {
+        for (int i = 0; i < x->Length && i < SM_L_->x->Length; ++i) {
+            SM_L_->x[i] = x[i];
+            SM_L_->y[i] = y[i];
+        }
+    }
+    finally { Monitor::Exit(SM_L_->lockObject); }
+}
+
 void LiDAR::threadFunction()
 {
     Console::WriteLine("[LiDAR] Connecting to simulator...");
