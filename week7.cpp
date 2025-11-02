@@ -1,3 +1,6 @@
+System::Console::ReadKey(true);
+
+
 #pragma once
 #include <NetworkedModule.h>
 #include <SMObjects.h>
@@ -34,17 +37,19 @@ private:
 
 
 
-
 #include "LiDAR.h"
 #include <cmath>
-using namespace System;
-using namespace System::Threading;
 
 using namespace System;
+using namespace System::Threading;
 using namespace System::Net::Sockets;
 using namespace System::Text;
-using namespace System::Threading;
+using namespace System::Globalization;
 
+LiDAR::LiDAR(SM_ThreadManagement^ sm_tm, SM_Lidar^ sm_l) {
+    SM_TM_ = sm_tm;
+    SM_L_  = sm_l;
+}
 
 void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^ y)
 {
@@ -61,107 +66,124 @@ void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^
 
 void LiDAR::threadFunction()
 {
-    Console::WriteLine("[LiDAR] Connecting to simulator...");
+    Console::WriteLine("[LiDAR] Connecting to simulator 127.0.0.1:23000 ...");
     TcpClient^ client = gcnew TcpClient();
-    try {
-        client->Connect("127.0.0.1", 23000);  // Simulator address and port
-    }
+    try { client->Connect("127.0.0.1", 23000); }
     catch (Exception^ e) {
-        Console::WriteLine("Failed to connect: {0}", e->Message);
+        Console::WriteLine("[LiDAR] Connect failed: {0}", e->Message);
         return;
     }
-
     NetworkStream^ stream = client->GetStream();
 
-   // ===== 构造一次性请求帧：STX 0x02 + "sRN LMDscandata" + ETX 0x03
-    // ===== 构造请求帧：STX + "sRN LMDscandata" + ETX =====
-array<Byte>^ cmd = Encoding::ASCII->GetBytes("sRN LMDscandata");
-array<Byte>^ req = gcnew array<Byte>(cmd->Length + 2);
-req[0] = 0x02;                       // STX
-Array::Copy(cmd, 0, req, 1, cmd->Length);
-req[req->Length - 1] = 0x03;         // ETX
+    // ===== 1) 认证：发送 zID（不带 'z'）+ '\n'，期望返回 "OK\n" =====
+    // TODO: 把下面替换成你自己的 zID（纯数字）
+    String^ zid = "1234567\n";
+    array<Byte>^ auth = Encoding::ASCII->GetBytes(zid);
+    stream->Write(auth, 0, auth->Length);
 
-array<Byte>^ rx = gcnew array<Byte>(16384);
-String^ carry = "";                  // 拼包缓冲
+    array<Byte>^ ackBuf = gcnew array<Byte>(64);
+    int ackLen = stream->Read(ackBuf, 0, ackBuf->Length);
+    String^ ack = (ackLen > 0) ? Encoding::ASCII->GetString(ackBuf, 0, ackLen) : "";
+    if (!ack->Contains("OK")) {
+        Console::WriteLine("[LiDAR] Auth failed, resp='{0}'", ack);
+        return;
+    }
+    Console::WriteLine("[LiDAR] Authenticated with simulator.");
 
-const int N = STANDARD_LIDAR_LENGTH; // 361
-array<double>^ x = gcnew array<double>(N);
-array<double>^ y = gcnew array<double>(N);
+    // ===== 2) 构造请求帧：STX(0x02) + "sRN LMDscandata" + ETX(0x03) =====
+    array<Byte>^ cmd = Encoding::ASCII->GetBytes("sRN LMDscandata");
+    array<Byte>^ req = gcnew array<Byte>(cmd->Length + 2);
+    req[0] = 0x02;                                // STX
+    Array::Copy(cmd, 0, req, 1, cmd->Length);
+    req[req->Length - 1] = 0x03;                  // ETX
 
-int frameId = 0;
+    // ===== 3) 读帧所需缓冲 =====
+    array<Byte>^ rx = gcnew array<Byte>(16384);
+    String^ carry = "";                           // 处理半包/粘包
 
-while (!getShutdownFlag()) {
-    // 1) 发送请求
-    stream->Write(req, 0, req->Length);
+    const int N = STANDARD_LIDAR_LENGTH;          // 361
+    array<double>^ x = gcnew array<double>(N);
+    array<double>^ y = gcnew array<double>(N);
+    int frameId = 0;
 
-    // 2) 读取至 ETX，兼容半包/粘包
-    String^ frame = nullptr;
-    for (;;) {
-        int m = 0;
-        try { m = stream->Read(rx, 0, rx->Length); }
-        catch (Exception^ e) { Console::WriteLine("[LiDAR] Read error: {0}", e->Message); return; }
-        if (m <= 0) { Console::WriteLine("[LiDAR] connection closed."); return; }
+    while (!getShutdownFlag()) {
+        // 发送请求
+        stream->Write(req, 0, req->Length);
 
-        String^ chunk = Encoding::ASCII->GetString(rx, 0, m);
-        carry += chunk;
+        // 读取到 ETX(0x03)，并去掉 STX/ETX
+        String^ frame = nullptr;
+        for (;;) {
+            int m = 0;
+            try { m = stream->Read(rx, 0, rx->Length); }
+            catch (Exception^ e) { Console::WriteLine("[LiDAR] Read error: {0}", e->Message); return; }
+            if (m <= 0) { Console::WriteLine("[LiDAR] connection closed."); return; }
 
-        int stx = carry->IndexOf((wchar_t)0x02);
-        int etx = carry->IndexOf((wchar_t)0x03);
-        if (stx >= 0 && etx > stx) {
-            frame = carry->Substring(stx + 1, etx - stx - 1); // 去掉 STX/ETX
-            carry = carry->Substring(etx + 1);
-            break;
+            String^ chunk = Encoding::ASCII->GetString(rx, 0, m);
+            carry += chunk;
+
+            int stx = carry->IndexOf((wchar_t)0x02);
+            int etx = carry->IndexOf((wchar_t)0x03);
+            if (stx >= 0 && etx > stx) {
+                frame = carry->Substring(stx + 1, etx - stx - 1);
+                carry = carry->Substring(etx + 1);
+                break;
+            }
+            if (carry->Length > 60000) { Console::WriteLine("[LiDAR] carry too long, reset."); carry = ""; }
         }
-        if (carry->Length > 60000) { Console::WriteLine("[LiDAR] carry too long, reset."); carry = ""; }
+
+        // 解析：找到 "DIST1 <count_hex> <d0> <d1> ... "
+        array<String^>^ tok = frame->Split(' ');
+        int idx = Array::IndexOf(tok, "DIST1");
+        if (idx < 0 || idx + 2 >= tok->Length) {
+            int preview = Math::Min(frame->Length, 120);
+            Console::WriteLine("[LiDAR] DIST1 not found. head='{0}'", frame->Substring(0, preview));
+            continue;
+        }
+
+        // 注意：count 是十六进制数
+        String^ countHex = tok[idx + 1];
+        int count = 0;
+        try { count = Convert::ToInt32(countHex, 16); }
+        catch (...) { Console::WriteLine("[LiDAR] count parse fail: '{0}'", countHex); continue; }
+
+        if (count != N || idx + 2 + count > tok->Length) {
+            Console::WriteLine("[LiDAR] count={0} (expect {1}), tokens={2}", count, N, tok->Length);
+            continue;
+        }
+
+        // 极坐标→笛卡尔（0°..180°, 步距 0.5°）
+        double minr = 1e9, maxr = -1e9;
+        for (int i = 0; i < N; ++i) {
+            int r_mm = 0;
+            String^ hex = tok[idx + 2 + i];
+            try { r_mm = Convert::ToInt32(hex, 16); } catch (...) { r_mm = 0; }
+            double r = r_mm / 1000.0;               // mm → m
+            double deg = 0.5 * i;                   // 0..180
+            double rad = deg * Math::PI / 180.0;
+            x[i] = r * Math::Cos(rad);
+            y[i] = r * Math::Sin(rad);
+            if (r > 0) { if (r < minr) minr = r; if (r > maxr) maxr = r; }
+        }
+
+        // 写共享内存 + 打印（live 证据）
+        writeScanToSharedMemory(x, y);
+
+        Console::Write("[LiDAR] frame {0}  n={1}  r[min,max]=[{2:F2},{3:F2}]  first10: ",
+            ++frameId, N, (minr<1e8?minr:0), (maxr>-1e8?maxr:0));
+        for (int i = 0; i < 10; ++i) Console::Write("( {0:F3},{1:F3} ) ", x[i], y[i]);
+        Console::WriteLine();
+
+        // 心跳（可选）
+        if (SM_TM_) {
+            Monitor::Enter(SM_TM_->lockObject);
+            try { SM_TM_->heartbeat |= bit_LIDAR; }
+            finally { Monitor::Exit(SM_TM_->lockObject); }
+        }
+
+        Thread::Sleep(40); // ~25 Hz
     }
 
-    // 3) 解析 —— 找 DIST1
-    array<String^>^ tok = frame->Split(' ');
-    int idx = Array::IndexOf(tok, "DIST1");
-    if (idx < 0 || idx + 2 >= tok->Length) {
-        // 打印前 120 个字符帮助诊断
-        int preview = Math::Min(frame->Length, 120);
-        Console::WriteLine("[LiDAR] DIST1 not found. head='{0}'", frame->Substring(0, preview));
-        continue;
-    }
-
-    int count = 0;
-    if (!Int32::TryParse(tok[idx + 1], System::Globalization::NumberStyles::HexNumber, nullptr, count)) {
-        Console::WriteLine("[LiDAR] count parse fail: '{0}'", tok[idx + 1]);
-        continue;
-    }
-    if (count != N || idx + 2 + count > tok->Length) {
-        Console::WriteLine("[LiDAR] count={0} (expect {1}), tokens={2}", count, N, tok->Length);
-        continue;
-    }
-
-    // 4) 极坐标→笛卡尔（0°..180°, 步距 0.5°）
-    double minr = 1e9, maxr = -1e9;
-    for (int i = 0; i < N; ++i) {
-        int r_mm = 0;
-        if (!Int32::TryParse(tok[idx + 2 + i], System::Globalization::NumberStyles::HexNumber, nullptr, r_mm)) r_mm = 0;
-        double r = r_mm / 1000.0;      // mm -> m
-        double deg = 0.5 * i;          // 0..180
-        double rad = deg * Math::PI / 180.0;
-        x[i] = r * Math::Cos(rad);
-        y[i] = r * Math::Sin(rad);
-        if (r > 0) { if (r < minr) minr = r; if (r > maxr) maxr = r; }
-    }
-
-    // 5) 写共享内存 + 打印“live”证据
-    writeScanToSharedMemory(x, y);
-
-    Console::Write("[LiDAR] frame {0}  n={1}  r[min,max]=[{2:F2},{3:F2}]  first10: ",
-        ++frameId, N, (minr<1e8?minr:0), (maxr>-1e8?maxr:0));
-    for (int i = 0; i < 10; ++i) Console::Write("( {0:F3},{1:F3} ) ", x[i], y[i]);
-    Console::WriteLine();
-
-    // 心跳（方便助教看多线程通信）
-    if (SM_TM_) { System::Threading::Monitor::Enter(SM_TM_->lockObject);
-        try { SM_TM_->heartbeat |= bit_LIDAR; }
-        finally { System::Threading::Monitor::Exit(SM_TM_->lockObject); } }
-
-    System::Threading::Thread::Sleep(40); // ~25 Hz
+    Console::WriteLine("[LiDAR] thread exit.");
 }
 
 
