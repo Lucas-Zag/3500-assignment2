@@ -134,7 +134,12 @@ void LiDAR::threadFunction()
         }
 
         // === 4) 解析：稳健定位 DIST1 的“点数”和数据起始下标 ===
-        array<String^>^ tok = frame->Split(' ', StringSplitOptions::RemoveEmptyEntries);
+
+        array<wchar_t>^ sep = gcnew array<wchar_t>{ ' ' };
+        array<String^>^ tok = frame->Split(sep, StringSplitOptions::RemoveEmptyEntries);
+
+        
+        //array<String^>^ tok = frame->Split(' ', StringSplitOptions::RemoveEmptyEntries);
         int idx = Array::IndexOf(tok, "DIST1");
         if (idx < 0) {
             int preview = Math::Min(frame->Length, 120);
