@@ -550,3 +550,118 @@ void VC::threadFunction() {
     Console::WriteLine("[VC] thread exit.");
 }
 
+
+#pragma once
+#include <UGVModule.h>
+#include <SMObjects.h>
+
+using namespace System;
+
+ref class Controller : public UGVModule {
+public:
+    Controller(SM_ThreadManagement^ sm_tm, SM_Lidar^ sm_l, SM_GNSS^ sm_g, SM_VehicleControl^ sm_vc);
+
+    virtual error_state processSharedMemory() override;
+    virtual bool getShutdownFlag() override;
+    virtual void threadFunction() override;
+
+private:
+    SM_Lidar^          SM_L_;
+    SM_GNSS^           SM_G_;
+    SM_VehicleControl^ SM_VC_;
+};
+
+
+
+#include "Controller.h"
+using namespace System;
+using namespace System::Threading;
+
+Controller::Controller(SM_ThreadManagement^ sm_tm, SM_Lidar^ sm_l, SM_GNSS^ sm_g, SM_VehicleControl^ sm_vc) {
+    SM_TM_ = sm_tm;
+    SM_L_  = sm_l;
+    SM_G_  = sm_g;
+    SM_VC_ = sm_vc;
+}
+
+error_state Controller::processSharedMemory() {
+    return error_state::SUCCESS; // Week 8 占位
+}
+
+bool Controller::getShutdownFlag() {
+    return (SM_TM_ != nullptr) && (SM_TM_->shutdown != 0);
+}
+
+void Controller::threadFunction() {
+    while (!getShutdownFlag()) {
+        // 心跳
+        if (SM_TM_) {
+            Monitor::Enter(SM_TM_->lockObject);
+            try { SM_TM_->heartbeat |= bit_CONTROLLER; }
+            finally { Monitor::Exit(SM_TM_->lockObject); }
+        }
+        Thread::Sleep(80);
+    }
+    Console::WriteLine("[Controller] thread exit.");
+}
+
+
+
+
+
+#pragma once
+#include <UGVModule.h>
+#include <SMObjects.h>
+
+using namespace System;
+
+ref class GNSS : public UGVModule {
+public:
+    GNSS(SM_ThreadManagement^ sm_tm, SM_GNSS^ sm_g);
+
+    virtual error_state processSharedMemory() override;
+    virtual bool getShutdownFlag() override;
+    virtual void threadFunction() override;
+
+private:
+    SM_GNSS^ SM_G_;
+};
+
+
+#include "GNSS.h"
+using namespace System;
+using namespace System::Threading;
+
+GNSS::GNSS(SM_ThreadManagement^ sm_tm, SM_GNSS^ sm_g) {
+    SM_TM_ = sm_tm;
+    SM_G_  = sm_g;
+}
+
+error_state GNSS::processSharedMemory() {
+    // Week 8 只需返回成功，Week 9 可在此写 GNSS 数据
+    return error_state::SUCCESS;
+}
+
+bool GNSS::getShutdownFlag() {
+    return (SM_TM_ != nullptr) && (SM_TM_->shutdown != 0);
+}
+
+void GNSS::threadFunction() {
+    Console::WriteLine("[GNSS] running...");
+    while (!getShutdownFlag()) {
+        // 设置心跳位，表示模块在运行
+        if (SM_TM_) {
+            Monitor::Enter(SM_TM_->lockObject);
+            try { SM_TM_->heartbeat |= bit_GNSS; }
+            finally { Monitor::Exit(SM_TM_->lockObject); }
+        }
+        Thread::Sleep(150); // 约 6~7 Hz 更新率
+    }
+    Console::WriteLine("[GNSS] thread exit.");
+}
+
+
+
+
+
+
