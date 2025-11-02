@@ -36,7 +36,6 @@ private:
 
 
 
-
 #include "LiDAR.h"
 #include <cmath>
 
@@ -46,11 +45,13 @@ using namespace System::Net::Sockets;
 using namespace System::Text;
 using namespace System::Globalization;
 
+// ===== ctor =====
 LiDAR::LiDAR(SM_ThreadManagement^ sm_tm, SM_Lidar^ sm_l) {
     SM_TM_ = sm_tm;
     SM_L_  = sm_l;
 }
 
+// ===== SM writer =====
 void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^ y)
 {
     if (!SM_L_) return;
@@ -64,6 +65,7 @@ void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^
     finally { Monitor::Exit(SM_L_->lockObject); }
 }
 
+// ===== main thread loop =====
 void LiDAR::threadFunction()
 {
     Console::WriteLine("[LiDAR] Connecting to simulator 127.0.0.1:23000 ...");
@@ -75,8 +77,8 @@ void LiDAR::threadFunction()
     }
     NetworkStream^ stream = client->GetStream();
 
-    // ===== 1) 认证：发送 zID（不带 'z'）+ '\n'，期望返回 "OK\n" =====
-    // TODO: 把下面替换成你自己的 zID（纯数字）
+    // --- 1) 认证：zID(不带 'z') + '\n' → 期待 "OK\n"
+    // TODO: 改成你的学号：例如 "5628323\n"
     String^ zid = "1234567\n";
     array<Byte>^ auth = Encoding::ASCII->GetBytes(zid);
     stream->Write(auth, 0, auth->Length);
@@ -90,18 +92,18 @@ void LiDAR::threadFunction()
     }
     Console::WriteLine("[LiDAR] Authenticated with simulator.");
 
-    // ===== 2) 构造请求帧：STX(0x02) + "sRN LMDscandata" + ETX(0x03) =====
+    // --- 2) 请求帧：STX(0x02) + "sRN LMDscandata" + ETX(0x03)
     array<Byte>^ cmd = Encoding::ASCII->GetBytes("sRN LMDscandata");
     array<Byte>^ req = gcnew array<Byte>(cmd->Length + 2);
-    req[0] = 0x02;                                // STX
+    req[0] = 0x02;                                 // STX
     Array::Copy(cmd, 0, req, 1, cmd->Length);
-    req[req->Length - 1] = 0x03;                  // ETX
+    req[req->Length - 1] = 0x03;                   // ETX
 
-    // ===== 3) 读帧所需缓冲 =====
+    // --- 3) 接收缓冲
     array<Byte>^ rx = gcnew array<Byte>(16384);
-    String^ carry = "";                           // 处理半包/粘包
+    String^ carry = "";                            // 处理半包/粘包
 
-    const int N = STANDARD_LIDAR_LENGTH;          // 361
+    const int N = STANDARD_LIDAR_LENGTH;           // 361
     array<double>^ x = gcnew array<double>(N);
     array<double>^ y = gcnew array<double>(N);
     int frameId = 0;
@@ -110,7 +112,7 @@ void LiDAR::threadFunction()
         // 发送请求
         stream->Write(req, 0, req->Length);
 
-        // 读取到 ETX(0x03)，并去掉 STX/ETX
+        // 读取到 ETX；去除 STX/ETX，留下纯 ASCII 帧
         String^ frame = nullptr;
         for (;;) {
             int m = 0;
@@ -131,41 +133,50 @@ void LiDAR::threadFunction()
             if (carry->Length > 60000) { Console::WriteLine("[LiDAR] carry too long, reset."); carry = ""; }
         }
 
-        // 解析：找到 "DIST1 <count_hex> <d0> <d1> ... "
-        array<String^>^ tok = frame->Split(' ');
+        // === 4) 解析：稳健定位 DIST1 的“点数”和数据起始下标 ===
+        array<String^>^ tok = frame->Split(' ', StringSplitOptions::RemoveEmptyEntries);
         int idx = Array::IndexOf(tok, "DIST1");
-        if (idx < 0 || idx + 2 >= tok->Length) {
+        if (idx < 0) {
             int preview = Math::Min(frame->Length, 120);
             Console::WriteLine("[LiDAR] DIST1 not found. head='{0}'", frame->Substring(0, preview));
             continue;
         }
 
-        // 注意：count 是十六进制数
-        String^ countHex = tok[idx + 1];
-        int count = 0;
-        try { count = Convert::ToInt32(countHex, 16); }
-        catch (...) { Console::WriteLine("[LiDAR] count parse fail: '{0}'", countHex); continue; }
+        // 有些实现会在 DIST1 后给出 scale/offset 等，点数并非紧随其后
+        int count = -1;
+        int dataStart = -1;
+        for (int j = idx + 1; j < Math::Min(idx + 12, tok->Length); ++j) {
+            int tryCount = 0;
+            bool ok = Int32::TryParse(tok[j], NumberStyles::HexNumber, nullptr, tryCount);
+            // 合理范围过滤（361 属于此范围），并确保后续 token 足够承载
+            if (ok && tryCount >= 10 && tryCount <= 2000) {
+                if (j + 1 + tryCount <= tok->Length) {
+                    count = tryCount;
+                    dataStart = j + 1;
+                    break;
+                }
+            }
+        }
 
-        if (count != N || idx + 2 + count > tok->Length) {
-            Console::WriteLine("[LiDAR] count={0} (expect {1}), tokens={2}", count, N, tok->Length);
+        if (count != N || dataStart < 0) {
+            Console::WriteLine("[LiDAR] count/offset unresolved. got count={0}, tokens={1}", count, tok->Length);
             continue;
         }
 
-        // 极坐标→笛卡尔（0°..180°, 步距 0.5°）
+        // === 5) 极坐标(mm) → 笛卡尔(m)；0..180°，步距 0.5°
         double minr = 1e9, maxr = -1e9;
         for (int i = 0; i < N; ++i) {
             int r_mm = 0;
-            String^ hex = tok[idx + 2 + i];
-            try { r_mm = Convert::ToInt32(hex, 16); } catch (...) { r_mm = 0; }
-            double r = r_mm / 1000.0;               // mm → m
-            double deg = 0.5 * i;                   // 0..180
+            Int32::TryParse(tok[dataStart + i], NumberStyles::HexNumber, nullptr, r_mm);
+            double r   = r_mm / 1000.0;                 // mm → m
+            double deg = 0.5 * i;                       // 0..180
             double rad = deg * Math::PI / 180.0;
             x[i] = r * Math::Cos(rad);
             y[i] = r * Math::Sin(rad);
             if (r > 0) { if (r < minr) minr = r; if (r > maxr) maxr = r; }
         }
 
-        // 写共享内存 + 打印（live 证据）
+        // === 6) 写共享内存 + 打印“live”证据 ===
         writeScanToSharedMemory(x, y);
 
         Console::Write("[LiDAR] frame {0}  n={1}  r[min,max]=[{2:F2},{3:F2}]  first10: ",
