@@ -40,61 +40,85 @@ private:
 using namespace System;
 using namespace System::Threading;
 
-void LiDAR::writeScanToSharedMemory(const array<double>^ x, const array<double>^ y)
-{
-    if (!SM_L_) return;
-    Monitor::Enter(SM_L_->lockObject);
-    try {
-        for (int i = 0; i < x->Length && i < SM_L_->x->Length; ++i) {
-            SM_L_->x[i] = x[i];
-            SM_L_->y[i] = y[i];
-        }
-    }
-    finally { Monitor::Exit(SM_L_->lockObject); }
-}
+using namespace System;
+using namespace System::Net::Sockets;
+using namespace System::Text;
+using namespace System::Threading;
 
 void LiDAR::threadFunction()
 {
-    Console::WriteLine("[LiDAR] running — writing 361 points to SM and printing (x,y).");
+    Console::WriteLine("[LiDAR] Connecting to simulator...");
+    TcpClient^ client = gcnew TcpClient();
+    try {
+        client->Connect("127.0.0.1", 23000);  // Simulator address and port
+    }
+    catch (Exception^ e) {
+        Console::WriteLine("Failed to connect: {0}", e->Message);
+        return;
+    }
 
-    // 每帧 361 点（0..360 度）
-    const int N = STANDARD_LIDAR_LENGTH; // 361
-    array<double>^ x = gcnew array<double>(N);
-    array<double>^ y = gcnew array<double>(N);
+    NetworkStream^ stream = client->GetStream();
 
-    double phase = 0.0; // 让点云随时间轻微摆动，便于助教看到“活数据”
-    while (!getShutdownFlag())
-    {
-        phase += 0.05; // ~20Hz 可见变化（下面 sleep 决定刷新率）
-        for (int i = 0; i < N; ++i) {
-            double deg = static_cast<double>(i);
-            double rad = deg * 3.14159265358979323846 / 180.0;
+    // ===== Step 1: Authenticate =====
+    String^ zid = "1234567\n";  // your zID number without 'z'
+    array<Byte>^ auth = Encoding::ASCII->GetBytes(zid);
+    stream->Write(auth, 0, auth->Length);
 
-            // 模拟半径：3~7 m 之间随角度和时间变化（Week8 可用模拟数据）
-            double r = 5.0 + 2.0 * std::sin(2.0 * rad + phase);
-            x[i] = r * std::cos(rad);
-            y[i] = r * std::sin(rad);
+    array<Byte>^ buffer = gcnew array<Byte>(64);
+    int len = stream->Read(buffer, 0, buffer->Length);
+    String^ resp = Encoding::ASCII->GetString(buffer, 0, len);
+    if (!resp->Contains("OK")) {
+        Console::WriteLine("Authentication failed.");
+        return;
+    }
+    Console::WriteLine("[LiDAR] Authenticated with simulator.");
+
+    // ===== Step 2: Repeatedly request scan =====
+    array<Byte>^ cmd = Encoding::ASCII->GetBytes("sRN LMDscandata");
+    array<Byte>^ request = gcnew array<Byte>(cmd->Length + 2);
+    request[0] = 0x02; // STX
+    Array::Copy(cmd, 0, request, 1, cmd->Length);
+    request[request->Length - 1] = 0x03; // ETX
+
+    array<Byte>^ recvBuf = gcnew array<Byte>(8192);
+
+    while (!getShutdownFlag()) {
+        // Send scan request
+        stream->Write(request, 0, request->Length);
+
+        // Read response
+        int bytesRead = stream->Read(recvBuf, 0, recvBuf->Length);
+        String^ data = Encoding::ASCII->GetString(recvBuf, 0, bytesRead);
+
+        // Extract distances from data
+        array<String^>^ tokens = data->Split(' ');
+        // 找到字段 "DIST1" 开始的位置
+        int startIndex = Array::IndexOf(tokens, "DIST1");
+        if (startIndex < 0 || startIndex + 2 >= tokens->Length) continue;
+        int numValues = Int32::Parse(tokens[startIndex + 1], System::Globalization::NumberStyles::HexNumber);
+
+        if (startIndex + 2 + numValues > tokens->Length) continue;
+        array<double>^ x = gcnew array<double>(numValues);
+        array<double>^ y = gcnew array<double>(numValues);
+
+        for (int i = 0; i < numValues; ++i) {
+            double r_mm = Convert::ToInt32(tokens[startIndex + 2 + i], 16);  // Hex → int
+            double r = r_mm / 1000.0;  // convert to meters
+            double angle_deg = 0.5 * i;  // since 180° / 360 points = 0.5° step
+            double angle_rad = angle_deg * Math::PI / 180.0;
+            x[i] = r * Math::Cos(angle_rad);
+            y[i] = r * Math::Sin(angle_rad);
         }
 
-        // 写入共享内存（SM_Lidar）
+        // 打印前几对点（防止刷屏）
+        Console::WriteLine("LiDAR XY (first 10 of {0} pts):", numValues);
+        for (int i = 0; i < Math::Min(numValues, 10); ++i)
+            Console::WriteLine("({0:F3}, {1:F3})", x[i], y[i]);
+
+        // 写入共享内存
         writeScanToSharedMemory(x, y);
 
-        // 心跳：置位自己的 bit（展示线程间通信；Week8 可选但建议有）
-        if (SM_TM_) {
-            Monitor::Enter(SM_TM_->lockObject);
-            try { SM_TM_->heartbeat |= bit_LIDAR; }
-            finally { Monitor::Exit(SM_TM_->lockObject); }
-        }
-
-        // 打印为 (x,y) 对；每行 8 对更易读
-        Console::WriteLine("LiDAR XY (361 pts):");
-        for (int i = 0; i < N; ++i) {
-            Console::Write("( {0:F3}, {1:F3} ){2}",
-                x[i], y[i], ((i % 8) == 7) ? "\n" : "  ");
-        }
-        if ((N % 8) != 0) Console::WriteLine();
-
-        Thread::Sleep(50); // ~20 Hz（足够 Week8 演示）
+        Thread::Sleep(50);  // ~20 Hz
     }
 
     Console::WriteLine("[LiDAR] thread exit.");
